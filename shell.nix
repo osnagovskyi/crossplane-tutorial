@@ -2,6 +2,7 @@
   packages = with pkgs; [
     gum
     gh
+    git
     kind
     kubectl
     yq-go

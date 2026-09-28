@@ -1,0 +1,891 @@
+# AKS composition variant for examples/azure-intro-blob.yaml.
+# Adds Blob Storage and PostgreSQL access using the app's shared workload identity.
+---
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: cluster-azure-blob
+  labels:
+    provider: azure
+    cluster: aks-blob
+spec:
+  compositeTypeRef:
+    apiVersion: devopstoolkitseries.com/v1alpha1
+    kind: CompositeCluster
+  mode: Pipeline
+  pipeline:
+  - functionRef:
+      name: crossplane-contrib-function-patch-and-transform
+    input:
+      apiVersion: pt.fn.crossplane.io/v1beta1
+      kind: Resources
+      resources:
+      - base:
+          apiVersion: azure.upbound.io/v1beta1
+          kind: ResourceGroup
+          spec:
+            forProvider:
+              location: eastus
+        name: resourcegroup
+        patches:
+        - fromFieldPath: spec.id
+          toFieldPath: metadata.name
+      - base:
+          apiVersion: containerservice.azure.upbound.io/v1beta1
+          kind: KubernetesCluster
+          spec:
+            forProvider:
+              defaultNodePool:
+              - enableAutoScaling: true
+                maxCount: 10
+                vmSize: Standard_D2_v2
+              dnsPrefix: dot
+              identity:
+              - type: SystemAssigned
+              location: eastus
+              networkProfile:
+              - networkPlugin: none
+              oidcIssuerEnabled: true
+              workloadIdentityEnabled: true
+        connectionDetails:
+        - fromConnectionSecretKey: kubeconfig
+          name: kubeconfig
+          type: FromConnectionSecretKey
+        - fromConnectionSecretKey: kubeconfig
+          name: value
+          type: FromConnectionSecretKey
+        name: aks
+        patches:
+        - fromFieldPath: spec.id
+          toFieldPath: metadata.name
+        - fromFieldPath: spec.id
+          toFieldPath: spec.writeConnectionSecretToRef.name
+          transforms:
+          - string:
+              fmt: "%s-cluster"
+              type: Format
+            type: string
+        - fromFieldPath: spec.claimRef.namespace
+          toFieldPath: spec.writeConnectionSecretToRef.namespace
+        - fromFieldPath: spec.id
+          toFieldPath: spec.forProvider.defaultNodePool[0].name
+        - fromFieldPath: spec.id
+          toFieldPath: spec.forProvider.resourceGroupName
+        - fromFieldPath: spec.parameters.version
+          toFieldPath: spec.forProvider.kubernetesVersion
+        - fromFieldPath: spec.parameters.minNodeCount
+          toFieldPath: spec.forProvider.defaultNodePool[0].minCount
+        - fromFieldPath: spec.parameters.nodeSize
+          toFieldPath: spec.forProvider.defaultNodePool[0].vmSize
+          transforms:
+          - map:
+              large: Standard_D4_v2
+              medium: Standard_D3_v2
+              small: Standard_D2_v2
+            type: map
+        - fromFieldPath: metadata.name
+          toFieldPath: status.clusterName
+          type: ToCompositeFieldPath
+        - fromFieldPath: status.conditions[0].reason
+          toFieldPath: status.controlPlaneStatus
+          type: ToCompositeFieldPath
+        - fromFieldPath: status.conditions[0].reason
+          toFieldPath: status.nodePoolStatus
+          type: ToCompositeFieldPath
+      - base:
+          apiVersion: helm.crossplane.io/v1beta1
+          kind: ProviderConfig
+          spec:
+            credentials:
+              secretRef:
+                key: kubeconfig
+                name: kubeconfig
+                namespace: crossplane-system
+              source: Secret
+        name: helm
+        patches:
+        - fromFieldPath: spec.id
+          toFieldPath: metadata.name
+        - fromFieldPath: spec.claimRef.namespace
+          toFieldPath: spec.credentials.secretRef.namespace
+        - fromFieldPath: spec.id
+          toFieldPath: spec.credentials.secretRef.name
+          transforms:
+          - string:
+              fmt: "%s-cluster"
+              type: Format
+            type: string
+        readinessChecks:
+        - type: None
+      - base:
+          apiVersion: helm.crossplane.io/v1beta1
+          kind: ProviderConfig
+          spec:
+            credentials:
+              source: InjectedIdentity
+        name: helm-local
+        patches:
+        - fromFieldPath: spec.id
+          toFieldPath: metadata.name
+          transforms:
+          - string:
+              fmt: "%s-local"
+              type: Format
+            type: string
+        - fromFieldPath: metadata.annotations
+          toFieldPath: metadata.annotations
+        readinessChecks:
+        - type: None
+      - base:
+          apiVersion: helm.crossplane.io/v1beta1
+          kind: Release
+          spec:
+            forProvider:
+              chart:
+                name: cilium
+                repository: https://helm.cilium.io
+                version: 1.14.2
+              namespace: kube-system
+              set:
+              - name: aksbyocni.enabled
+                value: 'true'
+              - name: nodeinit.enabled
+                value: 'true'
+              - name: authentication.mutual.spire.enabled
+                value: 'true'
+              - name: authentication.mutual.spire.install.enabled
+                value: 'true'
+            rollbackLimit: 3
+        name: cilium
+        patches:
+        - fromFieldPath: spec.id
+          toFieldPath: metadata.name
+          transforms:
+          - string:
+              fmt: "%s-cilium"
+              type: Format
+            type: string
+        - fromFieldPath: spec.id
+          toFieldPath: spec.providerConfigRef.name
+      - base:
+          apiVersion: kubernetes.crossplane.io/v1alpha1
+          kind: ProviderConfig
+          spec:
+            credentials:
+              secretRef:
+                key: kubeconfig
+                name: kubeconfig
+                namespace: crossplane-system
+              source: Secret
+        name: kubernetes
+        patches:
+        - fromFieldPath: spec.id
+          toFieldPath: metadata.name
+        - fromFieldPath: spec.claimRef.namespace
+          toFieldPath: spec.credentials.secretRef.namespace
+        - fromFieldPath: spec.id
+          toFieldPath: spec.credentials.secretRef.name
+          transforms:
+          - string:
+              fmt: "%s-cluster"
+              type: Format
+            type: string
+        readinessChecks:
+        - type: None
+    step: patch-and-transform
+  - functionRef:
+      name: crossplane-contrib-function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      inline:
+        template: |-
+          {{ if .observed.composite.resource.spec.parameters.apps.crossplane.enabled }}
+          ---
+          apiVersion: helm.crossplane.io/v1beta1
+          kind: Release
+          metadata:
+            name: '{{ $.observed.composite.resource.spec.id }}-app-crossplane'
+            annotations:
+              crossplane.io/external-name: crossplane
+              gotemplating.fn.crossplane.io/composition-resource-name: '{{ $.observed.composite.resource.spec.id }}-app-crossplane'
+          spec:
+            forProvider:
+              chart:
+                name: crossplane
+                repository: https://charts.crossplane.io/stable
+                version: 1.14.5
+                url: ""
+              set: []
+              values: {}
+              namespace: crossplane-system
+            rollbackLimit: 3
+            providerConfigRef:
+              name: '{{ $.observed.composite.resource.spec.id }}'
+          {{ end }}
+      kind: GoTemplate
+      source: Inline
+    step: app-crossplane
+  - functionRef:
+      name: crossplane-contrib-function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      inline:
+        template: |-
+          {{ if .observed.composite.resource.spec.parameters.apps.openfunction.enabled }}
+          ---
+          apiVersion: helm.crossplane.io/v1beta1
+          kind: Release
+          metadata:
+            name: '{{ $.observed.composite.resource.spec.id }}-app-openfunction'
+            annotations:
+              crossplane.io/external-name: openfunction
+              gotemplating.fn.crossplane.io/composition-resource-name: '{{ $.observed.composite.resource.spec.id }}-app-openfunction'
+          spec:
+            forProvider:
+              chart:
+                name: openfunction
+                repository: ""
+                version: ""
+                url: https://openfunction.github.io/charts/openfunction-v1.2.0-v0.7.0.tgz
+              set:
+                - name: revisionController.enable
+                  value: "true"
+              values: {}
+              namespace: openfunction
+            rollbackLimit: 3
+            providerConfigRef:
+              name: '{{ $.observed.composite.resource.spec.id }}'
+          {{ end }}
+      kind: GoTemplate
+      source: Inline
+    step: app-openfunction
+  - functionRef:
+      name: crossplane-contrib-function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      inline:
+        template: |-
+          {{ if .observed.composite.resource.spec.parameters.apps.dapr.enabled }}
+          ---
+          apiVersion: helm.crossplane.io/v1beta1
+          kind: Release
+          metadata:
+            name: '{{ $.observed.composite.resource.spec.id }}-app-dapr'
+            annotations:
+              crossplane.io/external-name: dapr
+              gotemplating.fn.crossplane.io/composition-resource-name: '{{ $.observed.composite.resource.spec.id }}-app-dapr'
+          spec:
+            forProvider:
+              chart:
+                name: dapr
+                repository: https://dapr.github.io/helm-charts/
+                version: 1.12.4
+                url: ""
+              set: []
+              values: {}
+              namespace: dapr-system
+            rollbackLimit: 3
+            providerConfigRef:
+              name: '{{ $.observed.composite.resource.spec.id }}'
+          {{ end }}
+      kind: GoTemplate
+      source: Inline
+    step: app-dapr
+  - functionRef:
+      name: crossplane-contrib-function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      inline:
+        template: |-
+          {{ if .observed.composite.resource.spec.parameters.apps.traefik.enabled }}
+          ---
+          apiVersion: helm.crossplane.io/v1beta1
+          kind: Release
+          metadata:
+            name: '{{ $.observed.composite.resource.spec.id }}-app-traefik'
+            annotations:
+              crossplane.io/external-name: traefik
+              gotemplating.fn.crossplane.io/composition-resource-name: '{{ $.observed.composite.resource.spec.id }}-app-traefik'
+          spec:
+            forProvider:
+              chart:
+                name: traefik
+                repository: https://helm.traefik.io/traefik
+                version: 26.0.0
+                url: ""
+              set: []
+              values: {}
+              namespace: traefik
+            rollbackLimit: 3
+            providerConfigRef:
+              name: '{{ $.observed.composite.resource.spec.id }}'
+          {{ end }}
+      kind: GoTemplate
+      source: Inline
+    step: app-traefik
+  - functionRef:
+      name: crossplane-contrib-function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      inline:
+        template: |-
+          {{ if .observed.composite.resource.spec.parameters.apps.dynatrace.enabled }}
+          ---
+          apiVersion: helm.crossplane.io/v1beta1
+          kind: Release
+          metadata:
+            name: '{{ $.observed.composite.resource.spec.id }}-app-dynatrace-operator'
+            annotations:
+              crossplane.io/external-name: dynatrace-operator
+              gotemplating.fn.crossplane.io/composition-resource-name: '{{ $.observed.composite.resource.spec.id }}-app-dynatrace-operator'
+          spec:
+            forProvider:
+              chart:
+                name: dynatrace-operator
+                repository: https://raw.githubusercontent.com/Dynatrace/dynatrace-operator/main/config/helm/repos/stable
+                version: 0.15.0
+                url: ""
+              set:
+                - name: installCRD
+                  value: "true"
+                - name: csidriver.enabled
+                  value: "true"
+              values: {}
+              namespace: dynatrace
+            rollbackLimit: 3
+            providerConfigRef:
+              name: '{{ $.observed.composite.resource.spec.id }}'
+          ---
+          apiVersion: kubernetes.crossplane.io/v1alpha2
+          kind: Object
+          metadata:
+            name: '{{ $.observed.composite.resource.spec.id }}-app-dynakube'
+            annotations:
+              crossplane.io/external-name: dynakube
+              gotemplating.fn.crossplane.io/composition-resource-name: '{{ $.observed.composite.resource.spec.id }}-app-dynakube'
+          spec:
+            forProvider:
+              manifest:
+                apiVersion: dynatrace.com/v1beta1
+                kind: DynaKube
+                metadata:
+                  name: '{{ $.observed.composite.resource.spec.id }}'
+                  namespace: dynatrace
+                  annotations:
+                    feature.dynatrace.com/k8s-app-enabled: "true"
+                spec:
+                  apiUrl: '{{ $.observed.composite.resource.spec.parameters.apps.dynatrace.apiUrl }}'
+                  oneAgent:
+                    cloudNativeFullStack:
+                      image: ""
+                  activeGate:
+                    capabilities:
+                      - kubernetes-monitoring
+                      - routing
+                      - metrics-ingest
+                      - dynatrace-api
+                    image: ""
+                    resources:
+                      requests:
+                        cpu: 500m
+                        memory: 512Mi
+                      limits:
+                        cpu: 1000m
+                        memory: 1.5Gi
+            providerConfigRef:
+              name: '{{ $.observed.composite.resource.spec.id }}'
+          ---
+          apiVersion: helm.crossplane.io/v1beta1
+          kind: Release
+          metadata:
+            name: '{{ $.observed.composite.resource.spec.id }}-app-dynatrace-dashboard'
+            annotations:
+              crossplane.io/external-name: dynatrace-dashboard
+              gotemplating.fn.crossplane.io/composition-resource-name: '{{ $.observed.composite.resource.spec.id }}-app-dynatrace-dashboard'
+          spec:
+            forProvider:
+              chart:
+                name: kubernetes-cluster
+                repository: https://katharinasick.github.io/crossplane-observability-demo-dynatrace
+                version: 0.2.2
+                url: ""
+              set: []
+              values:
+                oauthCredentialsSecretName: '{{ $.observed.composite.resource.spec.parameters.apps.dynatrace.oathCredentialsSecretName }}'
+                cluster: '{{ $.observed.composite.resource.spec.id }}-cluster'
+                dashboards:
+                  clusterOverview:
+                    enabled: true
+                  crossplaneMetrics:
+                    enabled: false
+              namespace: dynatrace
+            rollbackLimit: 3
+            providerConfigRef:
+              name: '{{ $.observed.composite.resource.spec.id }}-local'
+          {{ end }}
+      kind: GoTemplate
+      source: Inline
+    step: app-dynatrace
+  - functionRef:
+      name: crossplane-contrib-function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      inline:
+        template: |-
+          {{ if .observed.composite.resource.spec.parameters.apps.externalSecrets.enabled }}
+          ---
+          apiVersion: helm.crossplane.io/v1beta1
+          kind: Release
+          metadata:
+            name: '{{ $.observed.composite.resource.spec.id }}-app-external-secrets'
+            annotations:
+              crossplane.io/external-name: external-secrets
+              gotemplating.fn.crossplane.io/composition-resource-name: '{{ $.observed.composite.resource.spec.id }}-app-external-secrets'
+          spec:
+            forProvider:
+              chart:
+                name: external-secrets
+                repository: https://charts.external-secrets.io
+                version: 0.9.11
+                url: ""
+              set:
+                - name: installCRDs
+                  value: "true"
+              values: {}
+              namespace: external-secrets
+            rollbackLimit: 3
+            providerConfigRef:
+              name: '{{ $.observed.composite.resource.spec.id }}'
+          {{ end }}
+      kind: GoTemplate
+      source: Inline
+    step: app-external-secrets
+  - functionRef:
+      name: crossplane-contrib-function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      inline:
+        template: |-
+          {{ if and .observed.composite.resource.spec.parameters.apps.externalSecrets.enabled .observed.composite.resource.spec.parameters.apps.externalSecrets.store .observed.composite.resource.spec.parameters.apps.externalSecrets.azureVaultUrl }}
+          ---
+          apiVersion: kubernetes.crossplane.io/v1alpha2
+          kind: Object
+          metadata:
+            name: {{ $.observed.composite.resource.spec.id }}-secret-store
+            annotations:
+              crossplane.io/external-name: azure
+              gotemplating.fn.crossplane.io/composition-resource-name: {{ $.observed.composite.resource.spec.id }}-secret-store
+          spec:
+            forProvider:
+              manifest:
+                apiVersion: external-secrets.io/v1beta1
+                kind: ClusterSecretStore
+                metadata:
+                  name: azure
+                spec:
+                  provider:
+                    azurekv:
+                      authType: ManagedIdentity
+                      vaultUrl: {{ $.observed.composite.resource.spec.parameters.apps.externalSecrets.azureVaultUrl }}
+            providerConfigRef:
+              name: {{ $.observed.composite.resource.spec.id }}
+          {{ end }}
+      kind: GoTemplate
+      source: Inline
+    step: secret-store
+  - functionRef:
+      name: crossplane-contrib-function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      inline:
+        template: |-
+          {{ range .observed.composite.resource.spec.parameters.apps.externalSecrets.secrets }}
+          ---
+          apiVersion: kubernetes.crossplane.io/v1alpha2
+          kind: Object
+          metadata:
+            name: '{{ $.observed.composite.resource.spec.id }}-secret-{{ .toSecret }}'
+            annotations:
+              crossplane.io/external-name: '{{ .toSecret }}'
+              gotemplating.fn.crossplane.io/composition-resource-name: '{{ $.observed.composite.resource.spec.id }}-secret-{{ .toSecret }}'
+          spec:
+            forProvider:
+              manifest:
+                apiVersion: external-secrets.io/v1beta1
+                kind: ExternalSecret
+                metadata:
+                  name: '{{ .toSecret }}'
+                  namespace: '{{ .toNamespace }}'
+                spec:
+                  refreshInterval: 1h
+                  secretStoreRef:
+                    kind: ClusterSecretStore
+                    name: azure
+                  target:
+                    name: '{{ .toSecret }}'
+                    creationPolicy: Owner
+                    template:
+                      type: '{{ .type }}'
+                  dataFrom:
+                    - extract:
+                        key: '{{ .fromSecret }}'
+            providerConfigRef:
+              name: '{{ $.observed.composite.resource.spec.id }}'
+          {{ end }}
+      kind: GoTemplate
+      source: Inline
+    step: secrets
+  - functionRef:
+      name: crossplane-contrib-function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      inline:
+        template: |-
+          {{ range .observed.composite.resource.spec.parameters.namespaces }}
+          ---
+          apiVersion: kubernetes.crossplane.io/v1alpha2
+          kind: Object
+          metadata:
+            name: {{ $.observed.composite.resource.spec.id }}-ns-{{ . }}
+            annotations:
+              crossplane.io/external-name: {{ . }}
+              gotemplating.fn.crossplane.io/composition-resource-name: {{ $.observed.composite.resource.spec.id }}-ns-{{ . }}
+          spec:
+            forProvider:
+              manifest:
+                apiVersion: "v1"
+                kind: "Namespace"
+                metadata:
+                  name: {{ . }}
+            providerConfigRef:
+              name: {{ $.observed.composite.resource.spec.id }}
+          {{ end }}
+      kind: GoTemplate
+      source: Inline
+    step: namespaces
+  - functionRef:
+      name: crossplane-contrib-function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      inline:
+        template: |-
+          {{ if .observed.composite.resource.spec.parameters.creds }}
+          ---
+          apiVersion: kubernetes.crossplane.io/v1alpha2
+          kind: Object
+          metadata:
+            name: {{ $.observed.composite.resource.spec.id }}-creds
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: {{ $.observed.composite.resource.spec.id }}-creds
+              crossplane.io/external-name: {{ $.observed.composite.resource.spec.parameters.creds.name }}
+          spec:
+            references:
+            {{ range $.observed.composite.resource.spec.parameters.creds.keys }}
+            - patchesFrom:
+                apiVersion: v1
+                kind: Secret
+                name: {{ $.observed.composite.resource.spec.parameters.creds.name }}
+                namespace: {{ $.observed.composite.resource.spec.parameters.creds.namespace }}
+                fieldPath: data.{{ . }}
+              toFieldPath: data.{{ . }}
+            {{ end }}
+            forProvider:
+              manifest:
+                apiVersion: v1
+                kind: Secret
+                metadata:
+                  name: {{ $.observed.composite.resource.spec.parameters.creds.name }}
+                  namespace: {{ $.observed.composite.resource.spec.parameters.creds.namespace }}
+            providerConfigRef:
+              name: {{ $.observed.composite.resource.spec.id }}
+          {{ end }}
+      kind: GoTemplate
+      source: Inline
+    step: creds
+  - step: blob-storage-workload-identity
+    functionRef:
+      name: crossplane-contrib-function-go-templating
+    input:
+      apiVersion: gotemplating.fn.crossplane.io/v1beta1
+      kind: GoTemplate
+      source: Inline
+      inline:
+        template: |
+          {{- $xr := .observed.composite.resource -}}
+          {{- $id := $xr.spec.id -}}
+          {{- $accountName := printf "demo%s" (trunc 20 (sha256sum $xr.metadata.uid)) -}}
+          {{- $aks := get .observed.resources "aks" | default dict -}}
+          {{- $identity := get .observed.resources "blob-identity" | default dict -}}
+          {{- $account := get .observed.resources "blob-account" | default dict -}}
+          {{- $issuer := dig "resource" "status" "atProvider" "oidcIssuerUrl" "" $aks -}}
+          {{- $principalId := dig "resource" "status" "atProvider" "principalId" "" $identity -}}
+          {{- $clientId := dig "resource" "status" "atProvider" "clientId" "" $identity -}}
+          {{- $accountId := dig "resource" "status" "atProvider" "id" "" $account -}}
+          {{- $bootstrap := get .observed.resources "db-bootstrap-identity" | default dict -}}
+          {{- $db := get .observed.resources "demo-db-server" | default dict -}}
+          {{- $tenantId := dig "resource" "status" "atProvider" "tenantId" "" $identity -}}
+          {{- $bootstrapClientId := dig "resource" "status" "atProvider" "clientId" "" $bootstrap -}}
+          {{- $bootstrapPrincipalId := dig "resource" "status" "atProvider" "principalId" "" $bootstrap -}}
+          {{- $dbHost := dig "resource" "status" "atProvider" "fqdn" "" $db -}}
+
+          ---
+          apiVersion: storage.azure.upbound.io/v1beta1
+          kind: Account
+          metadata:
+            name: {{ $id }}-blob
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: blob-account
+              crossplane.io/external-name: {{ $accountName }}
+          spec:
+            forProvider:
+              resourceGroupNameRef:
+                name: {{ $id }}
+              location: eastus
+              accountKind: StorageV2
+              accountTier: Standard
+              accountReplicationType: LRS
+              minTlsVersion: TLS1_2
+              allowNestedItemsToBePublic: false
+            providerConfigRef:
+              name: default
+          ---
+          apiVersion: storage.azure.upbound.io/v1beta1
+          kind: Container
+          metadata:
+            name: {{ $id }}-blob-demo
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: blob-container
+              crossplane.io/external-name: demo
+          spec:
+            forProvider:
+              storageAccountNameRef:
+                name: {{ $id }}-blob
+              containerAccessType: private
+            providerConfigRef:
+              name: default
+          ---
+          apiVersion: managedidentity.azure.upbound.io/v1beta1
+          kind: UserAssignedIdentity
+          metadata:
+            name: {{ $id }}-blob-demo
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: blob-identity
+          spec:
+            forProvider:
+              location: eastus
+              resourceGroupNameRef:
+                name: {{ $id }}
+            providerConfigRef:
+              name: default
+          {{ if $issuer }}
+          ---
+          apiVersion: managedidentity.azure.upbound.io/v1beta1
+          kind: FederatedIdentityCredential
+          metadata:
+            name: {{ $id }}-blob-demo
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: blob-federation
+          spec:
+            forProvider:
+              audience:
+                - api://AzureADTokenExchange
+              issuer: {{ $issuer | quote }}
+              subject: system:serviceaccount:blob-demo:demo-blob-demo
+              parentIdRef:
+                name: {{ $id }}-blob-demo
+              resourceGroupNameRef:
+                name: {{ $id }}
+            providerConfigRef:
+              name: default
+          {{ end }}
+          {{ if and $principalId $accountId }}
+          ---
+          apiVersion: authorization.azure.upbound.io/v1beta1
+          kind: RoleAssignment
+          metadata:
+            name: {{ $id }}-blob-demo
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: blob-role
+          spec:
+            forProvider:
+              principalId: {{ $principalId | quote }}
+              roleDefinitionName: Storage Blob Data Contributor
+              scope: {{ printf "%s/blobServices/default/containers/demo" $accountId | quote }}
+              skipServicePrincipalAadCheck: true
+            providerConfigRef:
+              name: default
+          {{ end }}
+          ---
+          apiVersion: kubernetes.crossplane.io/v1alpha2
+          kind: Object
+          metadata:
+            name: {{ $id }}-blob-demo-namespace
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: blob-namespace
+          spec:
+            forProvider:
+              manifest:
+                apiVersion: v1
+                kind: Namespace
+                metadata:
+                  name: blob-demo
+            providerConfigRef:
+              name: {{ $id }}
+          {{ if and $clientId $principalId $bootstrapClientId $dbHost }}
+          ---
+          apiVersion: kubernetes.crossplane.io/v1alpha2
+          kind: Object
+          metadata:
+            name: {{ $id }}-blob-demo-values
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: blob-values
+          spec:
+            forProvider:
+              manifest:
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: blob-demo-values
+                  namespace: blob-demo
+                data:
+                  values.yaml: |
+                    azure:
+                      accountUrl: https://{{ $accountName }}.blob.core.windows.net
+                      container: demo
+                      existingSecret: ""
+                      createContainer: false
+                      workloadIdentity:
+                        enabled: true
+                        clientId: {{ $clientId | quote }}
+                    database:
+                      enabled: true
+                      host: {{ $dbHost | quote }}
+                      name: demo
+                      user: demo_app
+                      bootstrap:
+                        enabled: true
+                        clientId: {{ $bootstrapClientId | quote }}
+                        user: {{ $id }}-db-bootstrap
+                        appPrincipalId: {{ $principalId | quote }}
+            providerConfigRef:
+              name: {{ $id }}
+          {{ end }}
+          ---
+          apiVersion: managedidentity.azure.upbound.io/v1beta1
+          kind: UserAssignedIdentity
+          metadata:
+            name: {{ $id }}-db-bootstrap
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: db-bootstrap-identity
+              crossplane.io/external-name: {{ $id }}-db-bootstrap
+          spec:
+            forProvider:
+              location: eastus
+              resourceGroupNameRef:
+                name: {{ $id }}
+            providerConfigRef:
+              name: default
+          {{ if $issuer }}
+          ---
+          apiVersion: managedidentity.azure.upbound.io/v1beta1
+          kind: FederatedIdentityCredential
+          metadata:
+            name: {{ $id }}-db-bootstrap
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: db-bootstrap-federation
+          spec:
+            forProvider:
+              audience:
+                - api://AzureADTokenExchange
+              issuer: {{ $issuer | quote }}
+              subject: system:serviceaccount:blob-demo:demo-blob-demo-db-bootstrap
+              parentIdRef:
+                name: {{ $id }}-db-bootstrap
+              resourceGroupNameRef:
+                name: {{ $id }}
+            providerConfigRef:
+              name: default
+          {{ end }}
+          {{ if $tenantId }}
+          ---
+          apiVersion: dbforpostgresql.azure.upbound.io/v1beta2
+          kind: FlexibleServer
+          metadata:
+            name: {{ $id }}-demo-db
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: demo-db-server
+              crossplane.io/external-name: {{ printf "demo-pg-%s" (trunc 20 (sha256sum $xr.metadata.uid)) }}
+          spec:
+            forProvider:
+              resourceGroupNameRef:
+                name: {{ $id }}
+              location: eastus
+              version: "16"
+              skuName: B_Standard_B1ms
+              storageMb: 32768
+              backupRetentionDays: 7
+              publicNetworkAccessEnabled: true
+              authentication:
+                activeDirectoryAuthEnabled: true
+                passwordAuthEnabled: false
+                tenantId: {{ $tenantId | quote }}
+            providerConfigRef:
+              name: default
+          ---
+          apiVersion: dbforpostgresql.azure.upbound.io/v1beta1
+          kind: FlexibleServerDatabase
+          metadata:
+            name: {{ $id }}-demo-db
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: demo-db-database
+              crossplane.io/external-name: demo
+          spec:
+            forProvider:
+              serverIdRef:
+                name: {{ $id }}-demo-db
+              charset: UTF8
+              collation: en_US.utf8
+            providerConfigRef:
+              name: default
+          ---
+          # Demo networking: accepts Azure-origin traffic; Entra authentication remains required.
+          apiVersion: dbforpostgresql.azure.upbound.io/v1beta1
+          kind: FlexibleServerFirewallRule
+          metadata:
+            name: {{ $id }}-demo-db-azure
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: demo-db-firewall
+          spec:
+            forProvider:
+              serverIdRef:
+                name: {{ $id }}-demo-db
+              startIpAddress: 0.0.0.0
+              endIpAddress: 0.0.0.0
+            providerConfigRef:
+              name: default
+          {{ if $bootstrapPrincipalId }}
+          ---
+          apiVersion: dbforpostgresql.azure.upbound.io/v1beta1
+          kind: FlexibleServerActiveDirectoryAdministrator
+          metadata:
+            name: {{ $id }}-demo-db-admin
+            annotations:
+              gotemplating.fn.crossplane.io/composition-resource-name: demo-db-admin
+          spec:
+            forProvider:
+              serverNameRef:
+                name: {{ $id }}-demo-db
+              resourceGroupNameRef:
+                name: {{ $id }}
+              tenantId: {{ $tenantId | quote }}
+              objectId: {{ $bootstrapPrincipalId | quote }}
+              principalName: {{ $id }}-db-bootstrap
+              principalType: ServicePrincipal
+            providerConfigRef:
+              name: default
+          {{ end }}
+          {{ end }}
+  - functionRef:
+      name: crossplane-contrib-function-auto-ready
+    step: automatically-detect-ready-composed-resources
+  writeConnectionSecretsToNamespace: crossplane-system

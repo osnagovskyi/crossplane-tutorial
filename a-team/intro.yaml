@@ -1,0 +1,21 @@
+# Provisions AKS + Blob Storage + PostgreSQL 16 through cluster-azure-blob.
+# Prerequisites: ClusterClaim XRD, composition functions, Azure ProviderConfig default,
+# providers/azure-blob.yaml, and compositions/cluster-azure-blob/composition.yaml.
+# AKS enables OIDC and Workload Identity. The composition creates both data services,
+# the app identity, federated credentials, blob permissions, and a DB setup identity.
+# Install demo-app's Helm chart using the generated blob-demo-values ConfigMap:
+# its setup Job grants the shared app identity PostgreSQL row access.
+# Apply in a-team (same cluster-01 / cluster01 as azure-intro.yaml).
+# Full instructions: compositions/cluster-azure-blob/README.md
+---
+apiVersion: devopstoolkitseries.com/v1alpha1
+kind: ClusterClaim
+metadata:
+  name: cluster-01
+spec:
+  id: cluster01
+  compositionRef:
+    name: cluster-azure-blob
+  parameters:
+    nodeSize: small
+    minNodeCount: 3
